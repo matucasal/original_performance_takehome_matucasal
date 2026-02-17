@@ -139,6 +139,7 @@ class KernelBuilder:
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
+        v_three = self.alloc_scratch("v_three", VLEN)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         v_forest_base = self.alloc_scratch("v_forest_base", VLEN)
 
@@ -158,6 +159,7 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", v_zero, zero_const))
         self.add("valu", ("vbroadcast", v_one, one_const))
         self.add("valu", ("vbroadcast", v_two, two_const))
+        self.add("valu", ("vbroadcast", v_three, self.scratch_const(3)))
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
         self.add("valu", ("vbroadcast", v_forest_base, self.scratch["forest_values_p"]))
 
@@ -172,6 +174,19 @@ class KernelBuilder:
                 addr = self.alloc_scratch(f"v_const_{val3}", VLEN)
                 self.add("valu", ("vbroadcast", addr, self.scratch_const(val3)))
                 hash_vec_consts[val3] = addr
+
+        # Preload shallow nodes for load-free fast path on small depths.
+        max_fast_depth = min(2, forest_height)
+        fast_node_count = (1 << (max_fast_depth + 1)) - 1
+        shallow_s = [self.alloc_scratch(f"shallow_s_{i}") for i in range(fast_node_count)]
+        shallow_v = [self.alloc_scratch(f"shallow_v_{i}", VLEN) for i in range(fast_node_count)]
+        for ni in range(fast_node_count):
+            self.add(
+                "alu",
+                ("+", tmp_addr, self.scratch["forest_values_p"], self.scratch_const(ni)),
+            )
+            self.add("load", ("load", shallow_s[ni], tmp_addr))
+            self.add("valu", ("vbroadcast", shallow_v[ni], shallow_s[ni]))
 
         def emit_bundle(alu=None, valu=None, load=None, store=None, flow=None):
             instr = {}
@@ -192,19 +207,47 @@ class KernelBuilder:
             for j in range(0, len(slots), chunk_size):
                 emit_bundle(valu=slots[j : j + chunk_size])
 
-        def emit_group_round_ops(gs):
-            # Phase 2: gather address computation for all vectors in this group
-            emit_bundle(valu=[("+", v_addr[g], v_forest_base, v_idx[g]) for g in gs])
+        def emit_group_round_ops(gs, depth):
+            if depth <= max_fast_depth:
+                if depth == 0:
+                    emit_bundle(valu=[("+", v_node_val[g], shallow_v[0], v_zero) for g in gs])
+                elif depth == 1:
+                    # node = n2 + (idx&1) * (n1-n2)
+                    emit_bundle(valu=[("&", v_tmp1[g], v_idx[g], v_one) for g in gs])
+                    emit_bundle(valu=[("-", v_tmp2[g], shallow_v[1], shallow_v[2]) for g in gs])
+                    emit_bundle(valu=[("*", v_tmp2[g], v_tmp2[g], v_tmp1[g]) for g in gs])
+                    emit_bundle(valu=[("+", v_node_val[g], shallow_v[2], v_tmp2[g]) for g in gs])
+                else:
+                    # depth == 2, idx in [3..6], offset = idx-3.
+                    emit_bundle(valu=[("-", v_tmp1[g], v_idx[g], v_three) for g in gs])  # offset
+                    emit_bundle(valu=[("&", v_tmp2[g], v_tmp1[g], v_one) for g in gs])  # b0
+                    emit_bundle(valu=[(">>", v_tmp3[g], v_tmp1[g], v_one) for g in gs])  # offset>>1
+                    emit_bundle(valu=[("&", v_tmp3[g], v_tmp3[g], v_one) for g in gs])  # b1
+                    # lo = n3 + b0*(n4-n3)
+                    emit_bundle(valu=[("-", v_node_val[g], shallow_v[4], shallow_v[3]) for g in gs])
+                    emit_bundle(valu=[("*", v_node_val[g], v_node_val[g], v_tmp2[g]) for g in gs])
+                    emit_bundle(valu=[("+", v_node_val[g], shallow_v[3], v_node_val[g]) for g in gs])
+                    # hi = n5 + b0*(n6-n5)
+                    emit_bundle(valu=[("-", v_tmp1[g], shallow_v[6], shallow_v[5]) for g in gs])
+                    emit_bundle(valu=[("*", v_tmp1[g], v_tmp1[g], v_tmp2[g]) for g in gs])
+                    emit_bundle(valu=[("+", v_tmp1[g], shallow_v[5], v_tmp1[g]) for g in gs])
+                    # node = lo + b1*(hi-lo)
+                    emit_bundle(valu=[("-", v_tmp1[g], v_tmp1[g], v_node_val[g]) for g in gs])
+                    emit_bundle(valu=[("*", v_tmp1[g], v_tmp1[g], v_tmp3[g]) for g in gs])
+                    emit_bundle(valu=[("+", v_node_val[g], v_node_val[g], v_tmp1[g]) for g in gs])
+            else:
+                # Phase 2: gather address computation for all vectors in this group
+                emit_bundle(valu=[("+", v_addr[g], v_forest_base, v_idx[g]) for g in gs])
 
-            # Phase 3: gather loads interleaved by lane pair to keep load slots full
-            for lane in range(0, VLEN, 2):
-                for g in gs:
-                    emit_bundle(
-                        load=[
-                            ("load_offset", v_node_val[g], v_addr[g], lane),
-                            ("load_offset", v_node_val[g], v_addr[g], lane + 1),
-                        ]
-                    )
+                # Phase 3: gather loads interleaved by lane pair to keep load slots full
+                for lane in range(0, VLEN, 2):
+                    for g in gs:
+                        emit_bundle(
+                            load=[
+                                ("load_offset", v_node_val[g], v_addr[g], lane),
+                                ("load_offset", v_node_val[g], v_addr[g], lane + 1),
+                            ]
+                        )
 
             # Phase 4: XOR for all vectors in one cycle
             emit_bundle(valu=[("^", v_val[g], v_val[g], v_node_val[g]) for g in gs])
@@ -312,7 +355,8 @@ class KernelBuilder:
                 )
 
             for _round in range(rounds):
-                emit_group_round_ops(full_gs)
+                depth = _round % (forest_height + 1)
+                emit_group_round_ops(full_gs, depth)
 
             # One writeback per block after all rounds.
             for g in range(GROUP_VECS):
@@ -350,7 +394,8 @@ class KernelBuilder:
                 )
 
             for _round in range(rounds):
-                emit_group_round_ops(gs)
+                depth = _round % (forest_height + 1)
+                emit_group_round_ops(gs, depth)
 
             for g in gs:
                 emit_bundle(

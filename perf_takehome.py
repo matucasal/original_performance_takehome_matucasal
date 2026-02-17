@@ -228,11 +228,17 @@ class KernelBuilder:
 
             emit_bundle(valu=[("%", v_tmp1[g], v_val[g], v_two)])
             emit_bundle(valu=[("==", v_tmp1[g], v_tmp1[g], v_zero)])
-            emit_bundle(flow=[("vselect", v_tmp3[g], v_tmp1[g], v_one, v_two)])
-            emit_bundle(valu=[("*", v_idx[g], v_idx[g], v_two)])
+            emit_bundle(
+                valu=[
+                    ("-", v_tmp3[g], v_two, v_tmp1[g]),  # branch = 2 - is_even
+                    ("*", v_idx[g], v_idx[g], v_two),
+                ]
+            )
             emit_bundle(valu=[("+", v_idx[g], v_idx[g], v_tmp3[g])])
             emit_bundle(valu=[("<", v_tmp1[g], v_idx[g], v_n_nodes)])
-            emit_bundle(flow=[("vselect", v_idx[g], v_tmp1[g], v_idx[g], v_zero)])
+            emit_bundle(
+                valu=[("*", v_idx[g], v_idx[g], v_tmp1[g])]  # wrap: idx = idx * is_in_bounds
+            )
             emit_bundle(
                 store=[
                     ("vstore", tmp_idx_base[g], v_idx[g]),
@@ -336,11 +342,11 @@ class KernelBuilder:
                         ("==", v_tmp1[2], v_tmp1[2], v_zero),
                     ]
                 )
-                emit_bundle(flow=[("vselect", v_tmp3[0], v_tmp1[0], v_one, v_two)])
-                emit_bundle(flow=[("vselect", v_tmp3[1], v_tmp1[1], v_one, v_two)])
-                emit_bundle(flow=[("vselect", v_tmp3[2], v_tmp1[2], v_one, v_two)])
                 emit_bundle(
                     valu=[
+                        ("-", v_tmp3[0], v_two, v_tmp1[0]),  # branch = 2 - is_even
+                        ("-", v_tmp3[1], v_two, v_tmp1[1]),
+                        ("-", v_tmp3[2], v_two, v_tmp1[2]),
                         ("*", v_idx[0], v_idx[0], v_two),
                         ("*", v_idx[1], v_idx[1], v_two),
                         ("*", v_idx[2], v_idx[2], v_two),
@@ -360,9 +366,13 @@ class KernelBuilder:
                         ("<", v_tmp1[2], v_idx[2], v_n_nodes),
                     ]
                 )
-                emit_bundle(flow=[("vselect", v_idx[0], v_tmp1[0], v_idx[0], v_zero)])
-                emit_bundle(flow=[("vselect", v_idx[1], v_tmp1[1], v_idx[1], v_zero)])
-                emit_bundle(flow=[("vselect", v_idx[2], v_tmp1[2], v_idx[2], v_zero)])
+                emit_bundle(
+                    valu=[
+                        ("*", v_idx[0], v_idx[0], v_tmp1[0]),  # wrap: idx = idx * is_in_bounds
+                        ("*", v_idx[1], v_idx[1], v_tmp1[1]),
+                        ("*", v_idx[2], v_idx[2], v_tmp1[2]),
+                    ]
+                )
 
                 # Phase 7: stores (two-store engine -> 2 cycles for 3 vectors)
                 emit_bundle(
@@ -422,11 +432,11 @@ class KernelBuilder:
                     emit_bundle(alu=[(op2, tmp_val, tmp1, tmp2)])
                 emit_bundle(alu=[("%", tmp1, tmp_val, two_const)])
                 emit_bundle(alu=[("==", tmp1, tmp1, zero_const)])
-                emit_bundle(flow=[("select", tmp3, tmp1, one_const, two_const)])
+                emit_bundle(alu=[("-", tmp3, two_const, tmp1)])
                 emit_bundle(alu=[("*", tmp_idx, tmp_idx, two_const)])
                 emit_bundle(alu=[("+", tmp_idx, tmp_idx, tmp3)])
                 emit_bundle(alu=[("<", tmp1, tmp_idx, self.scratch["n_nodes"])])
-                emit_bundle(flow=[("select", tmp_idx, tmp1, tmp_idx, zero_const)])
+                emit_bundle(alu=[("*", tmp_idx, tmp_idx, tmp1)])
                 emit_bundle(alu=[("+", tmp_addr, self.scratch["inp_indices_p"], i_const)])
                 emit_bundle(store=[("store", tmp_addr, tmp_idx)])
                 emit_bundle(alu=[("+", tmp_addr, self.scratch["inp_values_p"], i_const)])

@@ -124,7 +124,7 @@ class KernelBuilder:
         # Any debug engine instruction is ignored by the submission simulator
         self.add("debug", ("comment", "Starting loop"))
 
-        GROUP_VECS = 3  # 3 * VLEN = 24 elements per software-pipelined group
+        GROUP_VECS = 4  # 4 * VLEN = 32 elements per software-pipelined group
 
         # Vector scratch registers for grouped processing
         v_idx = [self.alloc_scratch(f"v_idx_{g}", VLEN) for g in range(GROUP_VECS)]
@@ -249,7 +249,7 @@ class KernelBuilder:
 
         vec_batch = (batch_size // VLEN) * VLEN
         group_batch = (vec_batch // (GROUP_VECS * VLEN)) * (GROUP_VECS * VLEN)
-        # Grouped N=24 processing: load once -> run all rounds -> store once.
+        # Grouped processing: load once -> run all rounds -> store once.
         for i in range(0, group_batch, GROUP_VECS * VLEN):
             i_consts = [self.scratch_const(i + g * VLEN) for g in range(GROUP_VECS)]
 
@@ -261,19 +261,23 @@ class KernelBuilder:
                     ("+", tmp_val_base[1], self.scratch["inp_values_p"], i_consts[1]),
                     ("+", tmp_idx_base[2], self.scratch["inp_indices_p"], i_consts[2]),
                     ("+", tmp_val_base[2], self.scratch["inp_values_p"], i_consts[2]),
+                    ("+", tmp_idx_base[3], self.scratch["inp_indices_p"], i_consts[3]),
+                    ("+", tmp_val_base[3], self.scratch["inp_values_p"], i_consts[3]),
                 ]
             )
             emit_bundle(load=[("vload", v_idx[0], tmp_idx_base[0]), ("vload", v_val[0], tmp_val_base[0])])
             emit_bundle(load=[("vload", v_idx[1], tmp_idx_base[1]), ("vload", v_val[1], tmp_val_base[1])])
             emit_bundle(load=[("vload", v_idx[2], tmp_idx_base[2]), ("vload", v_val[2], tmp_val_base[2])])
+            emit_bundle(load=[("vload", v_idx[3], tmp_idx_base[3]), ("vload", v_val[3], tmp_val_base[3])])
 
             for _round in range(rounds):
-                # Phase 2: gather address computation for all three vectors
+                # Phase 2: gather address computation for all vectors in group
                 emit_bundle(
                     valu=[
                         ("+", v_addr[0], v_forest_base, v_idx[0]),
                         ("+", v_addr[1], v_forest_base, v_idx[1]),
                         ("+", v_addr[2], v_forest_base, v_idx[2]),
+                        ("+", v_addr[3], v_forest_base, v_idx[3]),
                     ]
                 )
 
@@ -297,17 +301,24 @@ class KernelBuilder:
                             ("load_offset", v_node_val[2], v_addr[2], lane + 1),
                         ]
                     )
+                    emit_bundle(
+                        load=[
+                            ("load_offset", v_node_val[3], v_addr[3], lane),
+                            ("load_offset", v_node_val[3], v_addr[3], lane + 1),
+                        ]
+                    )
 
-                # Phase 4: XOR for all three vectors in one cycle
+                # Phase 4: XOR for all vectors in one cycle
                 emit_bundle(
                     valu=[
                         ("^", v_val[0], v_val[0], v_node_val[0]),
                         ("^", v_val[1], v_val[1], v_node_val[1]),
                         ("^", v_val[2], v_val[2], v_node_val[2]),
+                        ("^", v_val[3], v_val[3], v_node_val[3]),
                     ]
                 )
 
-                # Phase 5: hash stages packed across 3 vectors
+                # Phase 5: hash stages packed across vectors
                 for op1, val1, op2, op3, val3 in HASH_STAGES:
                     emit_bundle(
                         valu=[
@@ -321,9 +332,16 @@ class KernelBuilder:
                     )
                     emit_bundle(
                         valu=[
+                            (op1, v_tmp1[3], v_val[3], hash_vec_consts[val1]),
+                            (op3, v_tmp2[3], v_val[3], hash_vec_consts[val3]),
+                        ]
+                    )
+                    emit_bundle(
+                        valu=[
                             (op2, v_val[0], v_tmp1[0], v_tmp2[0]),
                             (op2, v_val[1], v_tmp1[1], v_tmp2[1]),
                             (op2, v_val[2], v_tmp1[2], v_tmp2[2]),
+                            (op2, v_val[3], v_tmp1[3], v_tmp2[3]),
                         ]
                     )
 
@@ -333,6 +351,7 @@ class KernelBuilder:
                         ("%", v_tmp1[0], v_val[0], v_two),
                         ("%", v_tmp1[1], v_val[1], v_two),
                         ("%", v_tmp1[2], v_val[2], v_two),
+                        ("%", v_tmp1[3], v_val[3], v_two),
                     ]
                 )
                 emit_bundle(
@@ -340,6 +359,7 @@ class KernelBuilder:
                         ("==", v_tmp1[0], v_tmp1[0], v_zero),
                         ("==", v_tmp1[1], v_tmp1[1], v_zero),
                         ("==", v_tmp1[2], v_tmp1[2], v_zero),
+                        ("==", v_tmp1[3], v_tmp1[3], v_zero),
                     ]
                 )
                 emit_bundle(
@@ -347,9 +367,15 @@ class KernelBuilder:
                         ("-", v_tmp3[0], v_two, v_tmp1[0]),
                         ("-", v_tmp3[1], v_two, v_tmp1[1]),
                         ("-", v_tmp3[2], v_two, v_tmp1[2]),
+                        ("-", v_tmp3[3], v_two, v_tmp1[3]),
+                    ]
+                )
+                emit_bundle(
+                    valu=[
                         ("*", v_idx[0], v_idx[0], v_two),
                         ("*", v_idx[1], v_idx[1], v_two),
                         ("*", v_idx[2], v_idx[2], v_two),
+                        ("*", v_idx[3], v_idx[3], v_two),
                     ]
                 )
                 emit_bundle(
@@ -357,6 +383,7 @@ class KernelBuilder:
                         ("+", v_idx[0], v_idx[0], v_tmp3[0]),
                         ("+", v_idx[1], v_idx[1], v_tmp3[1]),
                         ("+", v_idx[2], v_idx[2], v_tmp3[2]),
+                        ("+", v_idx[3], v_idx[3], v_tmp3[3]),
                     ]
                 )
                 emit_bundle(
@@ -364,6 +391,7 @@ class KernelBuilder:
                         ("<", v_tmp1[0], v_idx[0], v_n_nodes),
                         ("<", v_tmp1[1], v_idx[1], v_n_nodes),
                         ("<", v_tmp1[2], v_idx[2], v_n_nodes),
+                        ("<", v_tmp1[3], v_idx[3], v_n_nodes),
                     ]
                 )
                 emit_bundle(
@@ -371,6 +399,7 @@ class KernelBuilder:
                         ("*", v_idx[0], v_idx[0], v_tmp1[0]),
                         ("*", v_idx[1], v_idx[1], v_tmp1[1]),
                         ("*", v_idx[2], v_idx[2], v_tmp1[2]),
+                        ("*", v_idx[3], v_idx[3], v_tmp1[3]),
                     ]
                 )
 
@@ -393,8 +422,14 @@ class KernelBuilder:
                     ("vstore", tmp_val_base[2], v_val[2]),
                 ]
             )
+            emit_bundle(
+                store=[
+                    ("vstore", tmp_idx_base[3], v_idx[3]),
+                    ("vstore", tmp_val_base[3], v_val[3]),
+                ]
+            )
 
-        # Leftover full vectors (if batch size not divisible by 24)
+        # Leftover full vectors (if batch size not divisible by 32)
         for i in range(group_batch, vec_batch, VLEN):
             g = 0
             i_const = self.scratch_const(i)

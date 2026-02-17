@@ -124,7 +124,7 @@ class KernelBuilder:
         # Any debug engine instruction is ignored by the submission simulator
         self.add("debug", ("comment", "Starting loop"))
 
-        GROUP_VECS = 4  # 4 * VLEN = 32 elements per software-pipelined group
+        GROUP_VECS = 6  # 6 * VLEN = 48 elements per software-pipelined group
 
         # Vector scratch registers for grouped processing
         v_idx = [self.alloc_scratch(f"v_idx_{g}", VLEN) for g in range(GROUP_VECS)]
@@ -187,6 +187,10 @@ class KernelBuilder:
                 instr["flow"] = flow
             if instr:
                 self.instrs.append(instr)
+
+        def emit_valu_chunks(slots, chunk_size=6):
+            for j in range(0, len(slots), chunk_size):
+                emit_bundle(valu=slots[j : j + chunk_size])
 
         def emit_vec_block_ops(g, write_back=False):
             # Gather node values: v_addr = forest_values_p + v_idx, then lane loads.
@@ -255,181 +259,69 @@ class KernelBuilder:
 
             emit_bundle(
                 alu=[
-                    ("+", tmp_idx_base[0], self.scratch["inp_indices_p"], i_consts[0]),
-                    ("+", tmp_val_base[0], self.scratch["inp_values_p"], i_consts[0]),
-                    ("+", tmp_idx_base[1], self.scratch["inp_indices_p"], i_consts[1]),
-                    ("+", tmp_val_base[1], self.scratch["inp_values_p"], i_consts[1]),
-                    ("+", tmp_idx_base[2], self.scratch["inp_indices_p"], i_consts[2]),
-                    ("+", tmp_val_base[2], self.scratch["inp_values_p"], i_consts[2]),
-                    ("+", tmp_idx_base[3], self.scratch["inp_indices_p"], i_consts[3]),
-                    ("+", tmp_val_base[3], self.scratch["inp_values_p"], i_consts[3]),
+                    slot
+                    for g in range(GROUP_VECS)
+                    for slot in [
+                        ("+", tmp_idx_base[g], self.scratch["inp_indices_p"], i_consts[g]),
+                        ("+", tmp_val_base[g], self.scratch["inp_values_p"], i_consts[g]),
+                    ]
                 ]
             )
-            emit_bundle(load=[("vload", v_idx[0], tmp_idx_base[0]), ("vload", v_val[0], tmp_val_base[0])])
-            emit_bundle(load=[("vload", v_idx[1], tmp_idx_base[1]), ("vload", v_val[1], tmp_val_base[1])])
-            emit_bundle(load=[("vload", v_idx[2], tmp_idx_base[2]), ("vload", v_val[2], tmp_val_base[2])])
-            emit_bundle(load=[("vload", v_idx[3], tmp_idx_base[3]), ("vload", v_val[3], tmp_val_base[3])])
+            for g in range(GROUP_VECS):
+                emit_bundle(
+                    load=[
+                        ("vload", v_idx[g], tmp_idx_base[g]),
+                        ("vload", v_val[g], tmp_val_base[g]),
+                    ]
+                )
 
             for _round in range(rounds):
                 # Phase 2: gather address computation for all vectors in group
-                emit_bundle(
-                    valu=[
-                        ("+", v_addr[0], v_forest_base, v_idx[0]),
-                        ("+", v_addr[1], v_forest_base, v_idx[1]),
-                        ("+", v_addr[2], v_forest_base, v_idx[2]),
-                        ("+", v_addr[3], v_forest_base, v_idx[3]),
-                    ]
-                )
+                emit_bundle(valu=[("+", v_addr[g], v_forest_base, v_idx[g]) for g in range(GROUP_VECS)])
 
                 # Phase 3: gather loads interleaved by lane pair to keep load slots full
                 for lane in range(0, VLEN, 2):
-                    emit_bundle(
-                        load=[
-                            ("load_offset", v_node_val[0], v_addr[0], lane),
-                            ("load_offset", v_node_val[0], v_addr[0], lane + 1),
-                        ]
-                    )
-                    emit_bundle(
-                        load=[
-                            ("load_offset", v_node_val[1], v_addr[1], lane),
-                            ("load_offset", v_node_val[1], v_addr[1], lane + 1),
-                        ]
-                    )
-                    emit_bundle(
-                        load=[
-                            ("load_offset", v_node_val[2], v_addr[2], lane),
-                            ("load_offset", v_node_val[2], v_addr[2], lane + 1),
-                        ]
-                    )
-                    emit_bundle(
-                        load=[
-                            ("load_offset", v_node_val[3], v_addr[3], lane),
-                            ("load_offset", v_node_val[3], v_addr[3], lane + 1),
-                        ]
-                    )
+                    for g in range(GROUP_VECS):
+                        emit_bundle(
+                            load=[
+                                ("load_offset", v_node_val[g], v_addr[g], lane),
+                                ("load_offset", v_node_val[g], v_addr[g], lane + 1),
+                            ]
+                        )
 
                 # Phase 4: XOR for all vectors in one cycle
-                emit_bundle(
-                    valu=[
-                        ("^", v_val[0], v_val[0], v_node_val[0]),
-                        ("^", v_val[1], v_val[1], v_node_val[1]),
-                        ("^", v_val[2], v_val[2], v_node_val[2]),
-                        ("^", v_val[3], v_val[3], v_node_val[3]),
-                    ]
-                )
+                emit_bundle(valu=[("^", v_val[g], v_val[g], v_node_val[g]) for g in range(GROUP_VECS)])
 
                 # Phase 5: hash stages packed across vectors
                 for op1, val1, op2, op3, val3 in HASH_STAGES:
+                    op13_slots = []
+                    for g in range(GROUP_VECS):
+                        op13_slots.append((op1, v_tmp1[g], v_val[g], hash_vec_consts[val1]))
+                        op13_slots.append((op3, v_tmp2[g], v_val[g], hash_vec_consts[val3]))
+                    emit_valu_chunks(op13_slots)
                     emit_bundle(
-                        valu=[
-                            (op1, v_tmp1[0], v_val[0], hash_vec_consts[val1]),
-                            (op3, v_tmp2[0], v_val[0], hash_vec_consts[val3]),
-                            (op1, v_tmp1[1], v_val[1], hash_vec_consts[val1]),
-                            (op3, v_tmp2[1], v_val[1], hash_vec_consts[val3]),
-                            (op1, v_tmp1[2], v_val[2], hash_vec_consts[val1]),
-                            (op3, v_tmp2[2], v_val[2], hash_vec_consts[val3]),
-                        ]
-                    )
-                    emit_bundle(
-                        valu=[
-                            (op1, v_tmp1[3], v_val[3], hash_vec_consts[val1]),
-                            (op3, v_tmp2[3], v_val[3], hash_vec_consts[val3]),
-                        ]
-                    )
-                    emit_bundle(
-                        valu=[
-                            (op2, v_val[0], v_tmp1[0], v_tmp2[0]),
-                            (op2, v_val[1], v_tmp1[1], v_tmp2[1]),
-                            (op2, v_val[2], v_tmp1[2], v_tmp2[2]),
-                            (op2, v_val[3], v_tmp1[3], v_tmp2[3]),
-                        ]
+                        valu=[(op2, v_val[g], v_tmp1[g], v_tmp2[g]) for g in range(GROUP_VECS)]
                     )
 
                 # Phase 6: index update and wrap
-                emit_bundle(
-                    valu=[
-                        ("%", v_tmp1[0], v_val[0], v_two),
-                        ("%", v_tmp1[1], v_val[1], v_two),
-                        ("%", v_tmp1[2], v_val[2], v_two),
-                        ("%", v_tmp1[3], v_val[3], v_two),
-                    ]
-                )
-                emit_bundle(
-                    valu=[
-                        ("==", v_tmp1[0], v_tmp1[0], v_zero),
-                        ("==", v_tmp1[1], v_tmp1[1], v_zero),
-                        ("==", v_tmp1[2], v_tmp1[2], v_zero),
-                        ("==", v_tmp1[3], v_tmp1[3], v_zero),
-                    ]
-                )
-                emit_bundle(
-                    valu=[
-                        ("-", v_tmp3[0], v_two, v_tmp1[0]),
-                        ("-", v_tmp3[1], v_two, v_tmp1[1]),
-                        ("-", v_tmp3[2], v_two, v_tmp1[2]),
-                        ("-", v_tmp3[3], v_two, v_tmp1[3]),
-                    ]
-                )
-                emit_bundle(
-                    valu=[
-                        ("*", v_idx[0], v_idx[0], v_two),
-                        ("*", v_idx[1], v_idx[1], v_two),
-                        ("*", v_idx[2], v_idx[2], v_two),
-                        ("*", v_idx[3], v_idx[3], v_two),
-                    ]
-                )
-                emit_bundle(
-                    valu=[
-                        ("+", v_idx[0], v_idx[0], v_tmp3[0]),
-                        ("+", v_idx[1], v_idx[1], v_tmp3[1]),
-                        ("+", v_idx[2], v_idx[2], v_tmp3[2]),
-                        ("+", v_idx[3], v_idx[3], v_tmp3[3]),
-                    ]
-                )
-                emit_bundle(
-                    valu=[
-                        ("<", v_tmp1[0], v_idx[0], v_n_nodes),
-                        ("<", v_tmp1[1], v_idx[1], v_n_nodes),
-                        ("<", v_tmp1[2], v_idx[2], v_n_nodes),
-                        ("<", v_tmp1[3], v_idx[3], v_n_nodes),
-                    ]
-                )
-                emit_bundle(
-                    valu=[
-                        ("*", v_idx[0], v_idx[0], v_tmp1[0]),
-                        ("*", v_idx[1], v_idx[1], v_tmp1[1]),
-                        ("*", v_idx[2], v_idx[2], v_tmp1[2]),
-                        ("*", v_idx[3], v_idx[3], v_tmp1[3]),
-                    ]
-                )
+                emit_bundle(valu=[("%", v_tmp1[g], v_val[g], v_two) for g in range(GROUP_VECS)])
+                emit_bundle(valu=[("==", v_tmp1[g], v_tmp1[g], v_zero) for g in range(GROUP_VECS)])
+                emit_bundle(valu=[("-", v_tmp3[g], v_two, v_tmp1[g]) for g in range(GROUP_VECS)])
+                emit_bundle(valu=[("*", v_idx[g], v_idx[g], v_two) for g in range(GROUP_VECS)])
+                emit_bundle(valu=[("+", v_idx[g], v_idx[g], v_tmp3[g]) for g in range(GROUP_VECS)])
+                emit_bundle(valu=[("<", v_tmp1[g], v_idx[g], v_n_nodes) for g in range(GROUP_VECS)])
+                emit_bundle(valu=[("*", v_idx[g], v_idx[g], v_tmp1[g]) for g in range(GROUP_VECS)])
 
             # One writeback per block after all rounds.
-            emit_bundle(
-                store=[
-                    ("vstore", tmp_idx_base[0], v_idx[0]),
-                    ("vstore", tmp_val_base[0], v_val[0]),
-                ]
-            )
-            emit_bundle(
-                store=[
-                    ("vstore", tmp_idx_base[1], v_idx[1]),
-                    ("vstore", tmp_val_base[1], v_val[1]),
-                ]
-            )
-            emit_bundle(
-                store=[
-                    ("vstore", tmp_idx_base[2], v_idx[2]),
-                    ("vstore", tmp_val_base[2], v_val[2]),
-                ]
-            )
-            emit_bundle(
-                store=[
-                    ("vstore", tmp_idx_base[3], v_idx[3]),
-                    ("vstore", tmp_val_base[3], v_val[3]),
-                ]
-            )
+            for g in range(GROUP_VECS):
+                emit_bundle(
+                    store=[
+                        ("vstore", tmp_idx_base[g], v_idx[g]),
+                        ("vstore", tmp_val_base[g], v_val[g]),
+                    ]
+                )
 
-        # Leftover full vectors (if batch size not divisible by 32)
+        # Leftover full vectors (if batch size not divisible by 48)
         for i in range(group_batch, vec_batch, VLEN):
             g = 0
             i_const = self.scratch_const(i)

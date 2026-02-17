@@ -188,7 +188,7 @@ class KernelBuilder:
             if instr:
                 self.instrs.append(instr)
 
-        def emit_vec_block_ops(g):
+        def emit_vec_block_ops(g, write_back=False):
             # Gather node values: v_addr = forest_values_p + v_idx, then lane loads.
             emit_bundle(valu=[("+", v_addr[g], v_forest_base, v_idx[g])])
             emit_bundle(
@@ -239,35 +239,35 @@ class KernelBuilder:
             emit_bundle(
                 valu=[("*", v_idx[g], v_idx[g], v_tmp1[g])]  # wrap: idx = idx * is_in_bounds
             )
-            emit_bundle(
-                store=[
-                    ("vstore", tmp_idx_base[g], v_idx[g]),
-                    ("vstore", tmp_val_base[g], v_val[g]),
-                ]
-            )
+            if write_back:
+                emit_bundle(
+                    store=[
+                        ("vstore", tmp_idx_base[g], v_idx[g]),
+                        ("vstore", tmp_val_base[g], v_val[g]),
+                    ]
+                )
 
         vec_batch = (batch_size // VLEN) * VLEN
         group_batch = (vec_batch // (GROUP_VECS * VLEN)) * (GROUP_VECS * VLEN)
-        for _round in range(rounds):
-            # Grouped N=24 processing
-            for i in range(0, group_batch, GROUP_VECS * VLEN):
-                i_consts = [self.scratch_const(i + g * VLEN) for g in range(GROUP_VECS)]
+        # Grouped N=24 processing: load once -> run all rounds -> store once.
+        for i in range(0, group_batch, GROUP_VECS * VLEN):
+            i_consts = [self.scratch_const(i + g * VLEN) for g in range(GROUP_VECS)]
 
-                # Phase 1: address + contiguous loads
-                emit_bundle(
-                    alu=[
-                        ("+", tmp_idx_base[0], self.scratch["inp_indices_p"], i_consts[0]),
-                        ("+", tmp_val_base[0], self.scratch["inp_values_p"], i_consts[0]),
-                        ("+", tmp_idx_base[1], self.scratch["inp_indices_p"], i_consts[1]),
-                        ("+", tmp_val_base[1], self.scratch["inp_values_p"], i_consts[1]),
-                        ("+", tmp_idx_base[2], self.scratch["inp_indices_p"], i_consts[2]),
-                        ("+", tmp_val_base[2], self.scratch["inp_values_p"], i_consts[2]),
-                    ]
-                )
-                emit_bundle(load=[("vload", v_idx[0], tmp_idx_base[0]), ("vload", v_val[0], tmp_val_base[0])])
-                emit_bundle(load=[("vload", v_idx[1], tmp_idx_base[1]), ("vload", v_val[1], tmp_val_base[1])])
-                emit_bundle(load=[("vload", v_idx[2], tmp_idx_base[2]), ("vload", v_val[2], tmp_val_base[2])])
+            emit_bundle(
+                alu=[
+                    ("+", tmp_idx_base[0], self.scratch["inp_indices_p"], i_consts[0]),
+                    ("+", tmp_val_base[0], self.scratch["inp_values_p"], i_consts[0]),
+                    ("+", tmp_idx_base[1], self.scratch["inp_indices_p"], i_consts[1]),
+                    ("+", tmp_val_base[1], self.scratch["inp_values_p"], i_consts[1]),
+                    ("+", tmp_idx_base[2], self.scratch["inp_indices_p"], i_consts[2]),
+                    ("+", tmp_val_base[2], self.scratch["inp_values_p"], i_consts[2]),
+                ]
+            )
+            emit_bundle(load=[("vload", v_idx[0], tmp_idx_base[0]), ("vload", v_val[0], tmp_val_base[0])])
+            emit_bundle(load=[("vload", v_idx[1], tmp_idx_base[1]), ("vload", v_val[1], tmp_val_base[1])])
+            emit_bundle(load=[("vload", v_idx[2], tmp_idx_base[2]), ("vload", v_val[2], tmp_val_base[2])])
 
+            for _round in range(rounds):
                 # Phase 2: gather address computation for all three vectors
                 emit_bundle(
                     valu=[
@@ -344,7 +344,7 @@ class KernelBuilder:
                 )
                 emit_bundle(
                     valu=[
-                        ("-", v_tmp3[0], v_two, v_tmp1[0]),  # branch = 2 - is_even
+                        ("-", v_tmp3[0], v_two, v_tmp1[0]),
                         ("-", v_tmp3[1], v_two, v_tmp1[1]),
                         ("-", v_tmp3[2], v_two, v_tmp1[2]),
                         ("*", v_idx[0], v_idx[0], v_two),
@@ -368,57 +368,65 @@ class KernelBuilder:
                 )
                 emit_bundle(
                     valu=[
-                        ("*", v_idx[0], v_idx[0], v_tmp1[0]),  # wrap: idx = idx * is_in_bounds
+                        ("*", v_idx[0], v_idx[0], v_tmp1[0]),
                         ("*", v_idx[1], v_idx[1], v_tmp1[1]),
                         ("*", v_idx[2], v_idx[2], v_tmp1[2]),
                     ]
                 )
 
-                # Phase 7: stores (two-store engine -> 2 cycles for 3 vectors)
-                emit_bundle(
-                    store=[
-                        ("vstore", tmp_idx_base[0], v_idx[0]),
-                        ("vstore", tmp_val_base[0], v_val[0]),
-                    ]
-                )
-                emit_bundle(
-                    store=[
-                        ("vstore", tmp_idx_base[1], v_idx[1]),
-                        ("vstore", tmp_val_base[1], v_val[1]),
-                    ]
-                )
-                emit_bundle(
-                    store=[
-                        ("vstore", tmp_idx_base[2], v_idx[2]),
-                        ("vstore", tmp_val_base[2], v_val[2]),
-                    ]
-                )
+            # One writeback per block after all rounds.
+            emit_bundle(
+                store=[
+                    ("vstore", tmp_idx_base[0], v_idx[0]),
+                    ("vstore", tmp_val_base[0], v_val[0]),
+                ]
+            )
+            emit_bundle(
+                store=[
+                    ("vstore", tmp_idx_base[1], v_idx[1]),
+                    ("vstore", tmp_val_base[1], v_val[1]),
+                ]
+            )
+            emit_bundle(
+                store=[
+                    ("vstore", tmp_idx_base[2], v_idx[2]),
+                    ("vstore", tmp_val_base[2], v_val[2]),
+                ]
+            )
 
-            # Leftover full vectors (if batch size not divisible by 24)
-            for i in range(group_batch, vec_batch, VLEN):
-                g = 0
-                i_const = self.scratch_const(i)
-                emit_bundle(
-                    alu=[
-                        ("+", tmp_idx_base[g], self.scratch["inp_indices_p"], i_const),
-                        ("+", tmp_val_base[g], self.scratch["inp_values_p"], i_const),
-                    ]
-                )
-                emit_bundle(
-                    load=[
-                        ("vload", v_idx[g], tmp_idx_base[g]),
-                        ("vload", v_val[g], tmp_val_base[g]),
-                    ]
-                )
-                emit_vec_block_ops(g)
+        # Leftover full vectors (if batch size not divisible by 24)
+        for i in range(group_batch, vec_batch, VLEN):
+            g = 0
+            i_const = self.scratch_const(i)
+            emit_bundle(
+                alu=[
+                    ("+", tmp_idx_base[g], self.scratch["inp_indices_p"], i_const),
+                    ("+", tmp_val_base[g], self.scratch["inp_values_p"], i_const),
+                ]
+            )
+            emit_bundle(
+                load=[
+                    ("vload", v_idx[g], tmp_idx_base[g]),
+                    ("vload", v_val[g], tmp_val_base[g]),
+                ]
+            )
+            for _round in range(rounds):
+                emit_vec_block_ops(g, write_back=False)
+            emit_bundle(
+                store=[
+                    ("vstore", tmp_idx_base[g], v_idx[g]),
+                    ("vstore", tmp_val_base[g], v_val[g]),
+                ]
+            )
 
-            # Scalar tail for non-multiple-of-VLEN batch sizes.
-            for i in range(vec_batch, batch_size):
-                i_const = self.scratch_const(i)
-                emit_bundle(alu=[("+", tmp_addr, self.scratch["inp_indices_p"], i_const)])
-                emit_bundle(load=[("load", tmp_idx, tmp_addr)])
-                emit_bundle(alu=[("+", tmp_addr, self.scratch["inp_values_p"], i_const)])
-                emit_bundle(load=[("load", tmp_val, tmp_addr)])
+        # Scalar tail for non-multiple-of-VLEN batch sizes: load once, run rounds, store once.
+        for i in range(vec_batch, batch_size):
+            i_const = self.scratch_const(i)
+            emit_bundle(alu=[("+", tmp_addr, self.scratch["inp_indices_p"], i_const)])
+            emit_bundle(load=[("load", tmp_idx, tmp_addr)])
+            emit_bundle(alu=[("+", tmp_addr, self.scratch["inp_values_p"], i_const)])
+            emit_bundle(load=[("load", tmp_val, tmp_addr)])
+            for _round in range(rounds):
                 emit_bundle(alu=[("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)])
                 emit_bundle(load=[("load", tmp_node_val, tmp_addr)])
                 emit_bundle(alu=[("^", tmp_val, tmp_val, tmp_node_val)])
@@ -437,10 +445,10 @@ class KernelBuilder:
                 emit_bundle(alu=[("+", tmp_idx, tmp_idx, tmp3)])
                 emit_bundle(alu=[("<", tmp1, tmp_idx, self.scratch["n_nodes"])])
                 emit_bundle(alu=[("*", tmp_idx, tmp_idx, tmp1)])
-                emit_bundle(alu=[("+", tmp_addr, self.scratch["inp_indices_p"], i_const)])
-                emit_bundle(store=[("store", tmp_addr, tmp_idx)])
-                emit_bundle(alu=[("+", tmp_addr, self.scratch["inp_values_p"], i_const)])
-                emit_bundle(store=[("store", tmp_addr, tmp_val)])
+            emit_bundle(alu=[("+", tmp_addr, self.scratch["inp_indices_p"], i_const)])
+            emit_bundle(store=[("store", tmp_addr, tmp_idx)])
+            emit_bundle(alu=[("+", tmp_addr, self.scratch["inp_values_p"], i_const)])
+            emit_bundle(store=[("store", tmp_addr, tmp_val)])
 
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
